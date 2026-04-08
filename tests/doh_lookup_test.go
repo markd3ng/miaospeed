@@ -1,4 +1,4 @@
-package utils
+package tests
 
 import (
 	"encoding/base64"
@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/airportr/miaospeed/utils"
 	"github.com/miekg/dns"
 )
 
@@ -79,7 +80,7 @@ func TestDohLookup_UsesCustomEndpointPath(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ips := DohLookup("example.com", server.URL+"/custom/dns-query")
+	ips := utils.DohLookup("example.com", server.URL+"/custom/dns-query")
 
 	if !containsIP(ips, "203.0.113.7") {
 		t.Fatalf("expected A record in DoH response, got %v", ips)
@@ -90,7 +91,7 @@ func TestDohLookup_UsesCustomEndpointPath(t *testing.T) {
 }
 
 func TestDohLookup_RequestFailureDoesNotPanic(t *testing.T) {
-	ips := DohLookup("example.com", "http://127.0.0.1:1/dns-query")
+	ips := utils.DohLookup("example.com", "http://127.0.0.1:1/dns-query")
 	if len(ips) != 0 {
 		t.Fatalf("expected no IPs on request failure, got %v", ips)
 	}

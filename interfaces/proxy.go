@@ -15,23 +15,24 @@ const (
 	Vmess        ProxyType = "Vmess"
 	Trojan       ProxyType = "Trojan"
 
-	Vless     ProxyType = "Vless"
-	Hysteria  ProxyType = "Hysteria"
-	Hysteria2 ProxyType = "Hysteria2"
-	TUIC      ProxyType = "TUIC"
-	Wireguard ProxyType = "Wireguard"
-	SSH       ProxyType = "SSH"
-	Mieru     ProxyType = "Mieru"
-	AnyTLS    ProxyType = "AnyTLS"
-	Sudoku    ProxyType = "Sudoku"
-	Masque    ProxyType = "Masque"
+	Vless       ProxyType = "Vless"
+	Hysteria    ProxyType = "Hysteria"
+	Hysteria2   ProxyType = "Hysteria2"
+	TUIC        ProxyType = "TUIC"
+	Wireguard   ProxyType = "Wireguard"
+	SSH         ProxyType = "SSH"
+	Mieru       ProxyType = "Mieru"
+	AnyTLS      ProxyType = "AnyTLS"
+	Sudoku      ProxyType = "Sudoku"
+	Masque      ProxyType = "Masque"
+	TrustTunnel ProxyType = "TrustTunnel"
 
 	ProxyInvalid ProxyType = "Invalid"
 )
 
 var AllProxyTypes = []ProxyType{
 	Shadowsocks, ShadowsocksR, Snell, Socks5, Http, Vmess, Trojan,
-	Vless, Hysteria, Hysteria2, TUIC, Wireguard, SSH, Mieru, AnyTLS, Sudoku, Masque,
+	Vless, Hysteria, Hysteria2, TUIC, Wireguard, SSH, Mieru, AnyTLS, Sudoku, Masque, TrustTunnel,
 }
 
 func (pt *ProxyType) Equal(other ProxyType) bool {

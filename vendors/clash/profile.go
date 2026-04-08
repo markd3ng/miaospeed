@@ -20,7 +20,10 @@ func patch() {
 }
 func parseProxy(proxyName, proxyPayload string) constant.Proxy {
 	var payload map[string]any
-	yaml.Unmarshal([]byte(proxyPayload), &payload)
+	if err := yaml.Unmarshal([]byte(proxyPayload), &payload); err != nil {
+		utils.DLogf("Vendor Parser | Parse clash profile yaml error, error=%v", err.Error())
+		return nil
+	}
 	proxy, err := adapter.ParseProxy(payload)
 
 	if err != nil {

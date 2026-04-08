@@ -131,7 +131,7 @@ func WrapErrorPure(desc string, erro any) (err error) {
 	if erro != nil {
 		switch x := erro.(type) {
 		case string:
-			err = fmt.Errorf(x)
+			err = errors.New(x)
 		case error:
 			err = x
 		default:
