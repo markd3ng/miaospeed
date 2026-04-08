@@ -32,6 +32,22 @@ func DNSLookuper(addr string, queryServers []string) []net.IP {
 		if server == "" {
 			continue
 		}
+		if configContent, matched, parseErr := parseMihomoDNSServerBase64(server); matched {
+			if parseErr != nil {
+				DLogf("Mihomo DNS token parse error | domain=%q | err=%v\n", addr, parseErr)
+				continue
+			}
+
+			ips, err := LookupByMihomoConfigBytes(configContent, addr)
+			if err != nil {
+				DLogf("Mihomo DNS lookup error | domain=%q | err=%v\n", addr, err)
+				continue
+			}
+			for _, ip := range ips {
+				ipSets[ip.String()] = ip
+			}
+			continue
+		}
 		// DoH query for HTTPS server
 		lowerServer := strings.ToLower(server)
 		if strings.HasPrefix(lowerServer, "https://") || strings.HasPrefix(lowerServer, "http://") {

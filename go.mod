@@ -34,6 +34,7 @@ require (
 	github.com/ericlagergren/subtle v0.0.0-20220507045147-890d697da010 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/gaukas/godicttls v0.0.4 // indirect
+	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.4+incompatible // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
@@ -66,6 +67,7 @@ require (
 	github.com/metacubex/hpke v0.1.0 // indirect
 	github.com/metacubex/http v0.1.1 // indirect
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604 // indirect
+	github.com/metacubex/mhurl v0.1.0 // indirect
 	github.com/metacubex/mlkem v0.1.0 // indirect
 	github.com/metacubex/qpack v0.6.0 // indirect
 	github.com/metacubex/quic-go v0.59.1-0.20260213014310-4df8f0de5b56 // indirect
@@ -77,6 +79,7 @@ require (
 	github.com/metacubex/sing-shadowsocks v0.2.12 // indirect
 	github.com/metacubex/sing-shadowsocks2 v0.2.7 // indirect
 	github.com/metacubex/sing-shadowtls v0.0.0-20250503063515-5d9f966d17a2 // indirect
+	github.com/metacubex/sing-tun v0.4.17 // indirect
 	github.com/metacubex/sing-vmess v0.2.5 // indirect
 	github.com/metacubex/sing-wireguard v0.0.0-20250503063753-2dc62acc626f // indirect
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141 // indirect
@@ -116,6 +119,7 @@ require (
 	golang.org/x/tools v0.26.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace github.com/miaokobot/miaospeed v0.0.0-20230313132009-0234a01d9daa => github.com/airportr/miaospeed v0.0.2
