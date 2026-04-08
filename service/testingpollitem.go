@@ -70,6 +70,19 @@ func (tpi *TestingPollItem) Yield(idx int, tpc *taskpoll.TPController) {
 		tpi.onProcess(tpi, idx, result)
 	}()
 
+	if tpi.request == nil || idx < 0 || idx >= len(tpi.request.Nodes) {
+		pollName := "unknown"
+		if tpc != nil {
+			pollName = tpc.Name()
+		}
+		nodeCount := 0
+		if tpi.request != nil {
+			nodeCount = len(tpi.request.Nodes)
+		}
+		utils.DWarnf("Task yield skipped due to invalid index, poll=%s task=%s idx=%d nodes=%d", pollName, tpi.TaskName(), idx, nodeCount)
+		return
+	}
+
 	node := tpi.request.Nodes[idx]
 	vendor := vendors.Find(tpi.request.Vendor).Build(node.Name, node.Payload)
 	result.ProxyInfo = vendor.ProxyInfo()
