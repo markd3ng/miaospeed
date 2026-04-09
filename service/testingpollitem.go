@@ -85,6 +85,9 @@ func (tpi *TestingPollItem) Yield(idx int, tpc *taskpoll.TPController) {
 
 	node := tpi.request.Nodes[idx]
 	vendor := vendors.Find(tpi.request.Vendor).Build(node.Name, node.Payload)
+	if dnsSetter, ok := vendor.(interface{ SetDNSServers([]string) }); ok {
+		dnsSetter.SetDNSServers(tpi.request.Configs.DNSServers)
+	}
 	result.ProxyInfo = vendor.ProxyInfo()
 	macroMap := structs.NewAsyncMap[interfaces.SlaveRequestMacroType, interfaces.SlaveRequestMacro]()
 

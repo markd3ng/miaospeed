@@ -303,3 +303,47 @@ func LookupByMihomoConfigBytes(configContent []byte, domain string) ([]net.IP, e
 
 	return client.LookupIP(ctx, domain)
 }
+
+// LookupByMihomoDNSServers resolves a domain by searching mihomo:// tokens in dns servers list.
+// It returns matched=false when there is no mihomo:// token.
+func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.IP, matched bool, err error) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil, false, fmt.Errorf("empty domain")
+	}
+
+	var lastErr error
+	for _, rawServer := range queryServers {
+		server := strings.TrimSpace(rawServer)
+		if server == "" {
+			continue
+		}
+		configContent, tokenMatched, parseErr := parseMihomoDNSServerBase64(server)
+		if !tokenMatched {
+			continue
+		}
+
+		matched = true
+		if parseErr != nil {
+			lastErr = parseErr
+			continue
+		}
+
+		ips, err = LookupByMihomoConfigBytes(configContent, domain)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(ips) > 0 {
+			return ips, true, nil
+		}
+	}
+
+	if !matched {
+		return nil, false, nil
+	}
+	if lastErr != nil {
+		return nil, true, lastErr
+	}
+	return nil, true, fmt.Errorf("mihomo dns has no ip for domain=%q", domain)
+}
