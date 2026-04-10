@@ -179,9 +179,11 @@ func getCachedMihomoDNSClientFromConfigFile(configPath string) (*MihomoDNSClient
 			cacheEntry.client != nil &&
 			cacheEntry.size == fileInfo.Size() &&
 			cacheEntry.modTime.Equal(fileInfo.ModTime()) {
+			DLogf("Mihomo DNS file cache hit | path=%q", absPath)
 			return cacheEntry.client, nil
 		}
 	}
+	DLogf("Mihomo DNS file cache miss | path=%q", absPath)
 
 	client, err := NewMihomoDNSClientFromConfigFile(absPath)
 	if err != nil {
@@ -216,9 +218,11 @@ func getCachedMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSCl
 
 	if cachedClientAny, ok := mihomoDNSContentCache.Load(cacheKey); ok {
 		if cachedClient, ok := cachedClientAny.(*MihomoDNSClient); ok && cachedClient != nil {
+			DLogf("Mihomo DNS content cache hit | key=%s", cacheKey)
 			return cachedClient, nil
 		}
 	}
+	DLogf("Mihomo DNS content cache miss | key=%s", cacheKey)
 
 	client, err := NewMihomoDNSClientFromConfigBytes(configContent)
 	if err != nil {
@@ -311,9 +315,10 @@ func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.I
 	if domain == "" {
 		return nil, false, fmt.Errorf("empty domain")
 	}
+	DLogf("Mihomo DNS lookup start | domain=%q | queryServers=%d", domain, len(queryServers))
 
 	var lastErr error
-	for _, rawServer := range queryServers {
+	for idx, rawServer := range queryServers {
 		server := strings.TrimSpace(rawServer)
 		if server == "" {
 			continue
@@ -324,26 +329,33 @@ func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.I
 		}
 
 		matched = true
+		DLogf("Mihomo DNS token matched | domain=%q | index=%d", domain, idx)
 		if parseErr != nil {
+			DLogf("Mihomo DNS token parse error | domain=%q | index=%d | err=%v", domain, idx, parseErr)
 			lastErr = parseErr
 			continue
 		}
 
 		ips, err = LookupByMihomoConfigBytes(configContent, domain)
 		if err != nil {
+			DLogf("Mihomo DNS token lookup failed | domain=%q | index=%d | err=%v", domain, idx, err)
 			lastErr = err
 			continue
 		}
 		if len(ips) > 0 {
+			DLogf("Mihomo DNS token lookup success | domain=%q | index=%d | ips=%v", domain, idx, ips)
 			return ips, true, nil
 		}
 	}
 
 	if !matched {
+		DLogf("Mihomo DNS lookup skip | domain=%q | reason=no mihomo token", domain)
 		return nil, false, nil
 	}
 	if lastErr != nil {
+		DLogf("Mihomo DNS lookup exhausted | domain=%q | err=%v", domain, lastErr)
 		return nil, true, lastErr
 	}
+	DLogf("Mihomo DNS lookup exhausted | domain=%q | err=no ip found", domain)
 	return nil, true, fmt.Errorf("mihomo dns has no ip for domain=%q", domain)
 }

@@ -60,6 +60,7 @@ func (c *Clash) SetDNSServers(servers []string) {
 		return
 	}
 	c.dnsServers = append([]string(nil), servers...)
+	utils.DLogf("Clash DNS servers updated | proxyName=%q | dnsServers=%d", c.proxyName, len(c.dnsServers))
 	c.rebuildProxy()
 }
 
@@ -124,9 +125,12 @@ func (c *Clash) applyMihomoDNSForDial(addr *constant.Metadata, network interface
 	if _, err := netip.ParseAddr(addr.Host); err == nil {
 		return
 	}
+	originalHost := addr.Host
+	utils.DLogf("Mihomo DNS dial resolve start | host=%q | network=%s | proxy=%s", originalHost, network.String(), c.proxy.Name())
 
 	ips, matched, err := utils.LookupByMihomoDNSServers(addr.Host, c.dnsServers)
 	if !matched {
+		utils.DLogf("Mihomo DNS dial resolve skip | host=%q | proxy=%s | reason=no mihomo token", originalHost, c.proxy.Name())
 		return
 	}
 	if err != nil {
@@ -141,6 +145,7 @@ func (c *Clash) applyMihomoDNSForDial(addr *constant.Metadata, network interface
 
 	addr.DstIP = resolvedIP
 	addr.Host = ""
+	utils.DLogf("Mihomo DNS dial resolved | host=%q | ip=%s | network=%s | proxy=%s", originalHost, resolvedIP.String(), network.String(), c.proxy.Name())
 }
 
 func (c *Clash) DialTCP(ctx context.Context, url string, network interfaces.RequestOptionsNetwork) (net.Conn, error) {
