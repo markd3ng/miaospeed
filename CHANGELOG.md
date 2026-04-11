@@ -1,11 +1,7 @@
-miaospeed v4.6.5
+miaospeed v4.6.6
 
-1. 优化了DoH的稳定性
-2. 支持了 trusttunnel 协议
-3. 支持了 VLESS/XHTTP 协议组合
-4. 更新mihomo到 v1.19.23
-5. 修复了一个测试队列的数组索引越界问题
-6. 现在支持通过 读取 mihomo的dns配置来进行dns解析，这对某些使用自定义dns的代理服务器有奇效
+1. 修复mihomo dns配置未生效问题
+2. 更多的dns解析日志
 
 ## Mihomo dns客户端集成
 
