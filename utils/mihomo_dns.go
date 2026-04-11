@@ -9,10 +9,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	mihomoConfig "github.com/metacubex/mihomo/config"
+	mihomoConst "github.com/metacubex/mihomo/constant"
 	mihomoDNS "github.com/metacubex/mihomo/dns"
 	mihomoExecutor "github.com/metacubex/mihomo/hub/executor"
 )
@@ -20,8 +23,11 @@ import (
 const mihomoDNSServerPrefix = "mihomo://"
 
 type MihomoDNSClient struct {
-	resolver *mihomoDNS.Resolver
-	ipv6     bool
+	resolver       *mihomoDNS.Resolver
+	proxyResolver  *mihomoDNS.Resolver
+	directResolver *mihomoDNS.Resolver
+	ipv6           bool
+	dnsTrace       string
 }
 
 type mihomoDNSCacheEntry struct {
@@ -91,6 +97,183 @@ func normalizeMihomoConfigPath(configPath string) (string, error) {
 	return absPath, nil
 }
 
+func sanitizeMihomoNameServers(nameServers []mihomoDNS.NameServer) []mihomoDNS.NameServer {
+	if len(nameServers) == 0 {
+		return nil
+	}
+	cleaned := make([]mihomoDNS.NameServer, 0, len(nameServers))
+	for _, ns := range nameServers {
+		if strings.EqualFold(strings.TrimSpace(ns.Net), "system") {
+			continue
+		}
+		// Ignore any `#proxy` tag (such as #DIRECT/#RULES/custom name) for our standalone DNS lookup path.
+		// Otherwise mihomo DNS dialer may treat unknown proxy name as interface and fail with "interface not found".
+		ns.ProxyName = ""
+		ns.ProxyAdapter = nil
+		cleaned = append(cleaned, ns)
+	}
+	return cleaned
+}
+
+func formatMihomoNameServer(ns mihomoDNS.NameServer) string {
+	addr := strings.TrimSpace(ns.Addr)
+	netType := strings.TrimSpace(ns.Net)
+	if netType == "" {
+		netType = "udp"
+	}
+	if strings.Contains(addr, "://") {
+		netType = ""
+	}
+	base := addr
+	if netType != "" {
+		base = fmt.Sprintf("%s://%s", netType, addr)
+	}
+	if ns.ProxyName != "" {
+		base = fmt.Sprintf("%s#proxy=%s", base, ns.ProxyName)
+	}
+	if len(ns.Params) > 0 {
+		keys := make([]string, 0, len(ns.Params))
+		for k := range ns.Params {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		params := make([]string, 0, len(keys))
+		for _, k := range keys {
+			params = append(params, fmt.Sprintf("%s=%s", k, ns.Params[k]))
+		}
+		base = fmt.Sprintf("%s{%s}", base, strings.Join(params, ","))
+	}
+	return base
+}
+
+func formatMihomoNameServerList(nameServers []mihomoDNS.NameServer) string {
+	if len(nameServers) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, len(nameServers))
+	for _, ns := range nameServers {
+		parts = append(parts, formatMihomoNameServer(ns))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func buildMihomoDNSTrace(dnsCfg *mihomoConfig.DNS) string {
+	if dnsCfg == nil {
+		return "dns=nil"
+	}
+	return fmt.Sprintf(
+		"ipv6=%t main=%s fallback=%s default=%s proxy=%s direct=%s policy=%d proxyPolicy=%d",
+		dnsCfg.IPv6,
+		formatMihomoNameServerList(dnsCfg.NameServer),
+		formatMihomoNameServerList(dnsCfg.Fallback),
+		formatMihomoNameServerList(dnsCfg.DefaultNameserver),
+		formatMihomoNameServerList(dnsCfg.ProxyServerNameserver),
+		formatMihomoNameServerList(dnsCfg.DirectNameServer),
+		len(dnsCfg.NameServerPolicy),
+		len(dnsCfg.ProxyServerPolicy),
+	)
+}
+
+func sanitizeMihomoPolicies(policies []mihomoDNS.Policy) []mihomoDNS.Policy {
+	if len(policies) == 0 {
+		return nil
+	}
+	cleaned := make([]mihomoDNS.Policy, 0, len(policies))
+	for _, policy := range policies {
+		policy.NameServers = sanitizeMihomoNameServers(policy.NameServers)
+		if len(policy.NameServers) == 0 {
+			continue
+		}
+		cleaned = append(cleaned, policy)
+	}
+	return cleaned
+}
+
+// sanitizeMihomoDNSConfigForLookup forces real-ip resolution behavior for this project.
+// User-provided configs may contain fake-ip/system resolver fields that are not desired here.
+func sanitizeMihomoDNSConfigForLookup(dnsCfg *mihomoConfig.DNS) {
+	if dnsCfg == nil {
+		return
+	}
+
+	if dnsCfg.EnhancedMode == mihomoConst.DNSFakeIP {
+		DLogf("Mihomo DNS config has enhanced-mode=fake-ip; forcing real-ip lookup mode")
+	}
+	dnsCfg.EnhancedMode = mihomoConst.DNSNormal
+	dnsCfg.FakeIPPool = nil
+	dnsCfg.FakeIPPool6 = nil
+	dnsCfg.FakeIPSkipper = nil
+	dnsCfg.FakeIPTTL = 0
+
+	dnsCfg.NameServer = sanitizeMihomoNameServers(dnsCfg.NameServer)
+	dnsCfg.Fallback = sanitizeMihomoNameServers(dnsCfg.Fallback)
+	dnsCfg.DefaultNameserver = sanitizeMihomoNameServers(dnsCfg.DefaultNameserver)
+	dnsCfg.ProxyServerNameserver = sanitizeMihomoNameServers(dnsCfg.ProxyServerNameserver)
+	dnsCfg.DirectNameServer = sanitizeMihomoNameServers(dnsCfg.DirectNameServer)
+	dnsCfg.NameServerPolicy = sanitizeMihomoPolicies(dnsCfg.NameServerPolicy)
+	dnsCfg.ProxyServerPolicy = sanitizeMihomoPolicies(dnsCfg.ProxyServerPolicy)
+
+	if len(dnsCfg.NameServer) == 0 {
+		switch {
+		case len(dnsCfg.DefaultNameserver) > 0:
+			dnsCfg.NameServer = append([]mihomoDNS.NameServer(nil), dnsCfg.DefaultNameserver...)
+		case len(dnsCfg.Fallback) > 0:
+			dnsCfg.NameServer = append([]mihomoDNS.NameServer(nil), dnsCfg.Fallback...)
+		}
+		if len(dnsCfg.NameServer) == 0 {
+			DWarnf("Mihomo DNS config has no usable nameserver after sanitization; will fallback to system resolver at lookup stage")
+		}
+	}
+}
+
+func lookupBySystemResolver(domain string) ([]net.IP, error) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("empty domain")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, 0, len(addrs))
+	seen := map[string]struct{}{}
+	for _, addr := range addrs {
+		ip := addr.IP
+		if ip == nil {
+			continue
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		ips = append(ips, ip)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no ip found by system resolver for domain=%q", domain)
+	}
+	return ips, nil
+}
+
+type mihomoResolverCandidate struct {
+	name     string
+	resolver *mihomoDNS.Resolver
+}
+
+func appendMihomoResolverCandidate(candidates []mihomoResolverCandidate, seen map[*mihomoDNS.Resolver]struct{}, name string, resolver *mihomoDNS.Resolver) []mihomoResolverCandidate {
+	if resolver == nil || !resolver.Invalid() {
+		return candidates
+	}
+	if _, ok := seen[resolver]; ok {
+		return candidates
+	}
+	seen[resolver] = struct{}{}
+	return append(candidates, mihomoResolverCandidate{name: name, resolver: resolver})
+}
+
 func newMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSClient, error) {
 	if len(configContent) == 0 {
 		return nil, fmt.Errorf("empty mihomo config")
@@ -107,6 +290,8 @@ func newMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSClient, 
 	if !cfg.DNS.Enable {
 		return nil, fmt.Errorf("mihomo dns is disabled in config")
 	}
+	sanitizeMihomoDNSConfigForLookup(cfg.DNS)
+	dnsTrace := buildMihomoDNSTrace(cfg.DNS)
 
 	ipv6 := cfg.DNS.IPv6
 	if cfg.General != nil {
@@ -135,8 +320,11 @@ func newMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSClient, 
 	}
 
 	return &MihomoDNSClient{
-		resolver: resolvers.Resolver,
-		ipv6:     ipv6,
+		resolver:       resolvers.Resolver,
+		proxyResolver:  resolvers.ProxyResolver,
+		directResolver: resolvers.DirectResolver,
+		ipv6:           ipv6,
+		dnsTrace:       dnsTrace,
 	}, nil
 }
 
@@ -233,8 +421,8 @@ func getCachedMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSCl
 	return client, nil
 }
 
-func (c *MihomoDNSClient) LookupIP(ctx context.Context, domain string) ([]net.IP, error) {
-	if c == nil || c.resolver == nil {
+func (c *MihomoDNSClient) lookupWithResolver(ctx context.Context, domain string, resolver *mihomoDNS.Resolver) ([]net.IP, error) {
+	if c == nil || resolver == nil || !resolver.Invalid() {
 		return nil, fmt.Errorf("mihomo dns client is not initialized")
 	}
 
@@ -248,9 +436,9 @@ func (c *MihomoDNSClient) LookupIP(ctx context.Context, domain string) ([]net.IP
 		err   error
 	)
 	if c.ipv6 {
-		addrs, err = c.resolver.LookupIP(ctx, domain)
+		addrs, err = resolver.LookupIP(ctx, domain)
 	} else {
-		addrs, err = c.resolver.LookupIPv4(ctx, domain)
+		addrs, err = resolver.LookupIPv4(ctx, domain)
 	}
 	if err != nil {
 		return nil, err
@@ -282,30 +470,108 @@ func (c *MihomoDNSClient) LookupIP(ctx context.Context, domain string) ([]net.IP
 	return ips, nil
 }
 
+func (c *MihomoDNSClient) LookupIP(ctx context.Context, domain string) ([]net.IP, error) {
+	return c.lookupWithResolver(ctx, domain, c.resolver)
+}
+
+func (c *MihomoDNSClient) lookupIPsWithPreference(ctx context.Context, domain string, preferProxy bool) (ips []net.IP, resolverName string, err error) {
+	if c == nil {
+		return nil, "", fmt.Errorf("mihomo dns client is not initialized")
+	}
+
+	candidates := make([]mihomoResolverCandidate, 0, 3)
+	seen := make(map[*mihomoDNS.Resolver]struct{}, 3)
+	if preferProxy {
+		candidates = appendMihomoResolverCandidate(candidates, seen, "proxy", c.proxyResolver)
+		candidates = appendMihomoResolverCandidate(candidates, seen, "main", c.resolver)
+		candidates = appendMihomoResolverCandidate(candidates, seen, "direct", c.directResolver)
+	} else {
+		candidates = appendMihomoResolverCandidate(candidates, seen, "main", c.resolver)
+		candidates = appendMihomoResolverCandidate(candidates, seen, "proxy", c.proxyResolver)
+		candidates = appendMihomoResolverCandidate(candidates, seen, "direct", c.directResolver)
+	}
+
+	if len(candidates) == 0 {
+		return nil, "", fmt.Errorf("mihomo dns has no available resolver")
+	}
+
+	resolverErrs := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ips, err = c.lookupWithResolver(ctx, domain, candidate.resolver)
+		if err == nil && len(ips) > 0 {
+			return ips, candidate.name, nil
+		}
+		if err != nil {
+			resolverErrs = append(resolverErrs, fmt.Sprintf("%s resolver: %v", candidate.name, err))
+		} else {
+			resolverErrs = append(resolverErrs, fmt.Sprintf("%s resolver: no ip found", candidate.name))
+		}
+	}
+
+	if len(resolverErrs) > 0 {
+		return nil, "", fmt.Errorf("all mihomo resolvers failed: %s", strings.Join(resolverErrs, " | "))
+	}
+	return nil, "", fmt.Errorf("mihomo dns has no ip for domain=%q", domain)
+}
+
+func lookupDomainByMihomoClient(domain string, source string, client *MihomoDNSClient, preferProxy bool) ([]net.IP, error) {
+	if client == nil {
+		ips, fallbackErr := lookupBySystemResolver(domain)
+		if fallbackErr == nil {
+			DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | dns=system_fallback | resolver=system | result=%v | reason=nil-client", source, domain, ips)
+			return ips, nil
+		}
+		DWarnf("Mihomo DNS lookup failed | source=%s | domain=%q | err=nil-client | systemErr=%v", source, domain, fallbackErr)
+		return nil, fmt.Errorf("nil mihomo dns client")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ips, resolverName, lookupErr := client.lookupIPsWithPreference(ctx, domain, preferProxy)
+	if lookupErr == nil {
+		DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | resolver=%s | dns=%s | result=%v", source, domain, resolverName, client.dnsTrace, ips)
+		return ips, nil
+	}
+
+	fallbackIPs, fallbackErr := lookupBySystemResolver(domain)
+	if fallbackErr == nil {
+		DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | dns=system_fallback | resolver=system | result=%v | reason=%v", source, domain, fallbackIPs, lookupErr)
+		return fallbackIPs, nil
+	}
+
+	DWarnf("Mihomo DNS lookup failed | source=%s | domain=%q | dns=%s | err=%v | systemErr=%v", source, domain, client.dnsTrace, lookupErr, fallbackErr)
+	return nil, lookupErr
+}
+
 // LookupByMihomoConfigFile resolves a domain with DNS settings from a mihomo config file.
 func LookupByMihomoConfigFile(configPath string, domain string) ([]net.IP, error) {
 	client, err := getCachedMihomoDNSClientFromConfigFile(configPath)
 	if err != nil {
+		ips, fallbackErr := lookupBySystemResolver(domain)
+		if fallbackErr == nil {
+			DWarnf("Mihomo DNS lookup done | source=config_file | domain=%q | dns=system_fallback | result=%v | reason=%v", domain, ips, err)
+			return ips, nil
+		}
+		DWarnf("Mihomo DNS lookup failed | source=config_file | domain=%q | err=%v | systemErr=%v", domain, err, fallbackErr)
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	return client.LookupIP(ctx, domain)
+	return lookupDomainByMihomoClient(domain, "config_file", client, true)
 }
 
 // LookupByMihomoConfigBytes resolves a domain with DNS settings from in-memory mihomo config bytes.
 func LookupByMihomoConfigBytes(configContent []byte, domain string) ([]net.IP, error) {
 	client, err := getCachedMihomoDNSClientFromConfigBytes(configContent)
 	if err != nil {
+		ips, fallbackErr := lookupBySystemResolver(domain)
+		if fallbackErr == nil {
+			DWarnf("Mihomo DNS lookup done | source=config_bytes | domain=%q | dns=system_fallback | result=%v | reason=%v", domain, ips, err)
+			return ips, nil
+		}
+		DWarnf("Mihomo DNS lookup failed | source=config_bytes | domain=%q | err=%v | systemErr=%v", domain, err, fallbackErr)
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	return client.LookupIP(ctx, domain)
+	return lookupDomainByMihomoClient(domain, "config_bytes", client, true)
 }
 
 // LookupByMihomoDNSServers resolves a domain by searching mihomo:// tokens in dns servers list.
@@ -336,7 +602,13 @@ func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.I
 			continue
 		}
 
-		ips, err = LookupByMihomoConfigBytes(configContent, domain)
+		client, clientErr := getCachedMihomoDNSClientFromConfigBytes(configContent)
+		if clientErr != nil {
+			DLogf("Mihomo DNS token client init failed | domain=%q | index=%d | err=%v", domain, idx, clientErr)
+			lastErr = clientErr
+			continue
+		}
+		ips, err = lookupDomainByMihomoClient(domain, fmt.Sprintf("token[%d]", idx), client, true)
 		if err != nil {
 			DLogf("Mihomo DNS token lookup failed | domain=%q | index=%d | err=%v", domain, idx, err)
 			lastErr = err
