@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/miekg/dns"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/miekg/dns"
 
 	"github.com/airportr/miaospeed/interfaces"
 	"github.com/airportr/miaospeed/utils/structs/memutils"
@@ -34,13 +35,11 @@ func DNSLookuper(addr string, queryServers []string) []net.IP {
 		}
 		if configContent, matched, parseErr := parseMihomoDNSServerBase64(server); matched {
 			if parseErr != nil {
-				DLogf("Mihomo DNS token parse error | domain=%q | err=%v\n", addr, parseErr)
 				continue
 			}
 
 			ips, err := LookupByMihomoConfigBytes(configContent, addr)
 			if err != nil {
-				DLogf("Mihomo DNS lookup error | domain=%q | err=%v\n", addr, err)
 				continue
 			}
 			for _, ip := range ips {

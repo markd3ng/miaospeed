@@ -1,14 +1,15 @@
 package clash
 
 import (
+	"net"
+	"strings"
+
 	"github.com/airportr/miaospeed/interfaces"
 	"github.com/airportr/miaospeed/utils"
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/constant"
 	vendorlog "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
-	"net"
-	"strings"
 )
 
 func init() {
@@ -66,11 +67,9 @@ func applyMihomoDNSForProxyServer(payload map[string]any, dnsServers []string) {
 	if net.ParseIP(server) != nil {
 		return
 	}
-	utils.DLogf("Mihomo DNS proxy server resolve start | server=%q | dnsServers=%d", server, len(dnsServers))
 
 	ips, matched, err := utils.LookupByMihomoDNSServers(server, dnsServers)
 	if !matched {
-		utils.DLogf("Mihomo DNS proxy server resolve skip | server=%q | reason=no mihomo token", server)
 		return
 	}
 	if err != nil {
@@ -88,7 +87,6 @@ func applyMihomoDNSForProxyServer(payload map[string]any, dnsServers []string) {
 	// Preserve original domain for TLS/SNI-sensitive protocols.
 	setStringIfMissing(payload, "sni", server)
 	setStringIfMissing(payload, "servername", server)
-	utils.DLogf("Mihomo DNS proxy server rewritten | domain=%q | ip=%q | sni=%v | servername=%v", server, resolvedIP, payload["sni"], payload["servername"])
 }
 
 func parseProxy(proxyName, proxyPayload string, dnsServers []string) constant.Proxy {

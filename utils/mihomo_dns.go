@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -11,16 +12,26 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/lru"
 	mihomoConfig "github.com/metacubex/mihomo/config"
 	mihomoConst "github.com/metacubex/mihomo/constant"
 	mihomoDNS "github.com/metacubex/mihomo/dns"
 	mihomoExecutor "github.com/metacubex/mihomo/hub/executor"
+	"golang.org/x/sync/singleflight"
 )
 
-const mihomoDNSServerPrefix = "mihomo://"
+const (
+	mihomoDNSServerPrefix = "mihomo://"
+
+	mihomoDNSTokenCacheMaxEntries     = 1024
+	mihomoDNSClientCacheMaxEntries    = 256
+	mihomoDNSFileStateCacheMaxEntries = 256
+	mihomoDNSCacheIdleSeconds          int64 = 30 * 60
+	mihomoDNSLookupLogWindowSeconds    int64 = 15
+	mihomoDNSLookupLogCacheMaxEntries        = 4096
+)
 
 type MihomoDNSClient struct {
 	resolver       *mihomoDNS.Resolver
@@ -30,19 +41,60 @@ type MihomoDNSClient struct {
 	dnsTrace       string
 }
 
-type mihomoDNSCacheEntry struct {
+type mihomoDNSTokenParseCacheEntry struct {
+	matched       bool
+	configContent []byte
+	errText       string
+}
+
+type mihomoDNSFileStateCacheEntry struct {
 	modTime time.Time
 	size    int64
-	client  *MihomoDNSClient
+	// configHash is sha256(configContent) for this file snapshot.
+	configHash string
 }
 
 var (
-	mihomoDNSFileCache   sync.Map
-	mihomoDNSFileCacheMu sync.Mutex
+	mihomoDNSTokenParseCache = lru.New[string, *mihomoDNSTokenParseCacheEntry](
+		lru.WithSize[string, *mihomoDNSTokenParseCacheEntry](mihomoDNSTokenCacheMaxEntries),
+		lru.WithAge[string, *mihomoDNSTokenParseCacheEntry](mihomoDNSCacheIdleSeconds),
+	)
+	mihomoDNSFileStateCache = lru.New[string, *mihomoDNSFileStateCacheEntry](
+		lru.WithSize[string, *mihomoDNSFileStateCacheEntry](mihomoDNSFileStateCacheMaxEntries),
+		lru.WithAge[string, *mihomoDNSFileStateCacheEntry](mihomoDNSCacheIdleSeconds),
+	)
+	mihomoDNSClientCache = lru.New[string, *MihomoDNSClient](
+		lru.WithSize[string, *MihomoDNSClient](mihomoDNSClientCacheMaxEntries),
+		lru.WithAge[string, *MihomoDNSClient](mihomoDNSCacheIdleSeconds),
+	)
+	mihomoDNSLookupSuccessLogCache = lru.New[string, struct{}](
+		lru.WithSize[string, struct{}](mihomoDNSLookupLogCacheMaxEntries),
+		lru.WithAge[string, struct{}](mihomoDNSLookupLogWindowSeconds),
+	)
 
-	mihomoDNSContentCache   sync.Map
-	mihomoDNSContentCacheMu sync.Mutex
+	mihomoDNSClientBuildGroup singleflight.Group
 )
+
+func cloneMihomoConfigBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	return cp
+}
+
+func shouldLogMihomoDNSLookupSuccess(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return true
+	}
+	if _, ok := mihomoDNSLookupSuccessLogCache.Get(domain); ok {
+		return false
+	}
+	mihomoDNSLookupSuccessLogCache.Set(domain, struct{}{})
+	return true
+}
 
 func parseMihomoDNSServer(server string) (configPath string, ok bool) {
 	server = strings.TrimSpace(server)
@@ -60,10 +112,26 @@ func parseMihomoDNSServer(server string) (configPath string, ok bool) {
 }
 
 func parseMihomoDNSServerBase64(server string) (configContent []byte, matched bool, err error) {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return nil, false, nil
+	}
+	if cached, ok := mihomoDNSTokenParseCache.Get(server); ok && cached != nil {
+		if cached.errText != "" {
+			return nil, cached.matched, errors.New(cached.errText)
+		}
+		return cloneMihomoConfigBytes(cached.configContent), cached.matched, nil
+	}
+
 	encoded, ok := parseMihomoDNSServer(server)
 	if !ok {
 		return nil, false, nil
 	}
+
+	cacheEntry := &mihomoDNSTokenParseCacheEntry{matched: true}
+	defer func() {
+		mihomoDNSTokenParseCache.Set(server, cacheEntry)
+	}()
 
 	decoders := []*base64.Encoding{
 		base64.StdEncoding,
@@ -75,13 +143,18 @@ func parseMihomoDNSServerBase64(server string) (configContent []byte, matched bo
 		decoded, decodeErr := decoder.DecodeString(encoded)
 		if decodeErr == nil {
 			if len(decoded) == 0 {
-				return nil, true, fmt.Errorf("empty base64 mihomo dns config")
+				err = fmt.Errorf("empty base64 mihomo dns config")
+				cacheEntry.errText = err.Error()
+				return nil, true, err
 			}
+			cacheEntry.configContent = cloneMihomoConfigBytes(decoded)
 			return decoded, true, nil
 		}
 	}
 
-	return nil, true, fmt.Errorf("invalid base64 mihomo dns config")
+	err = fmt.Errorf("invalid base64 mihomo dns config")
+	cacheEntry.errText = err.Error()
+	return nil, true, err
 }
 
 func normalizeMihomoConfigPath(configPath string) (string, error) {
@@ -348,6 +421,39 @@ func NewMihomoDNSClientFromConfigFile(configPath string) (*MihomoDNSClient, erro
 	return newMihomoDNSClientFromConfigBytes(configContent)
 }
 
+func getCachedMihomoDNSClientByHash(cacheKey string, configContent []byte) (*MihomoDNSClient, error) {
+	cacheKey = strings.TrimSpace(cacheKey)
+	if cacheKey == "" {
+		return nil, fmt.Errorf("empty mihomo config cache key")
+	}
+
+	if cachedClient, ok := mihomoDNSClientCache.Get(cacheKey); ok && cachedClient != nil {
+		return cachedClient, nil
+	}
+
+	sharedVal, err, _ := mihomoDNSClientBuildGroup.Do(cacheKey, func() (any, error) {
+		if cachedClient, ok := mihomoDNSClientCache.Get(cacheKey); ok && cachedClient != nil {
+			return cachedClient, nil
+		}
+
+		client, buildErr := NewMihomoDNSClientFromConfigBytes(configContent)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		mihomoDNSClientCache.Set(cacheKey, client)
+		return client, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	client, ok := sharedVal.(*MihomoDNSClient)
+	if !ok || client == nil {
+		return nil, fmt.Errorf("invalid mihomo dns client cache value for key=%s", cacheKey)
+	}
+	return client, nil
+}
+
 func getCachedMihomoDNSClientFromConfigFile(configPath string) (*MihomoDNSClient, error) {
 	absPath, err := normalizeMihomoConfigPath(configPath)
 	if err != nil {
@@ -359,29 +465,33 @@ func getCachedMihomoDNSClientFromConfigFile(configPath string) (*MihomoDNSClient
 		return nil, fmt.Errorf("stat mihomo config path=%q failed: %w", absPath, err)
 	}
 
-	mihomoDNSFileCacheMu.Lock()
-	defer mihomoDNSFileCacheMu.Unlock()
-
-	if cacheEntryAny, ok := mihomoDNSFileCache.Load(absPath); ok {
-		if cacheEntry, ok := cacheEntryAny.(*mihomoDNSCacheEntry); ok && cacheEntry != nil &&
-			cacheEntry.client != nil &&
-			cacheEntry.size == fileInfo.Size() &&
-			cacheEntry.modTime.Equal(fileInfo.ModTime()) {
-			DLogf("Mihomo DNS file cache hit | path=%q", absPath)
-			return cacheEntry.client, nil
+	if fileState, ok := mihomoDNSFileStateCache.Get(absPath); ok && fileState != nil &&
+		fileState.size == fileInfo.Size() &&
+		fileState.modTime.Equal(fileInfo.ModTime()) &&
+		fileState.configHash != "" {
+		if cachedClient, ok := mihomoDNSClientCache.Get(fileState.configHash); ok && cachedClient != nil {
+			return cachedClient, nil
 		}
 	}
-	DLogf("Mihomo DNS file cache miss | path=%q", absPath)
 
-	client, err := NewMihomoDNSClientFromConfigFile(absPath)
+	configContent, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("read mihomo config path=%q failed: %w", absPath, err)
+	}
+	cacheKey, err := mihomoConfigContentKey(configContent)
 	if err != nil {
 		return nil, err
 	}
 
-	mihomoDNSFileCache.Store(absPath, &mihomoDNSCacheEntry{
+	client, err := getCachedMihomoDNSClientByHash(cacheKey, configContent)
+	if err != nil {
+		return nil, err
+	}
+
+	mihomoDNSFileStateCache.Set(absPath, &mihomoDNSFileStateCacheEntry{
 		modTime: fileInfo.ModTime(),
 		size:    fileInfo.Size(),
-		client:  client,
+		configHash: cacheKey,
 	})
 
 	return client, nil
@@ -401,24 +511,7 @@ func getCachedMihomoDNSClientFromConfigBytes(configContent []byte) (*MihomoDNSCl
 		return nil, err
 	}
 
-	mihomoDNSContentCacheMu.Lock()
-	defer mihomoDNSContentCacheMu.Unlock()
-
-	if cachedClientAny, ok := mihomoDNSContentCache.Load(cacheKey); ok {
-		if cachedClient, ok := cachedClientAny.(*MihomoDNSClient); ok && cachedClient != nil {
-			DLogf("Mihomo DNS content cache hit | key=%s", cacheKey)
-			return cachedClient, nil
-		}
-	}
-	DLogf("Mihomo DNS content cache miss | key=%s", cacheKey)
-
-	client, err := NewMihomoDNSClientFromConfigBytes(configContent)
-	if err != nil {
-		return nil, err
-	}
-
-	mihomoDNSContentCache.Store(cacheKey, client)
-	return client, nil
+	return getCachedMihomoDNSClientByHash(cacheKey, configContent)
 }
 
 func (c *MihomoDNSClient) lookupWithResolver(ctx context.Context, domain string, resolver *mihomoDNS.Resolver) ([]net.IP, error) {
@@ -518,10 +611,8 @@ func lookupDomainByMihomoClient(domain string, source string, client *MihomoDNSC
 	if client == nil {
 		ips, fallbackErr := lookupBySystemResolver(domain)
 		if fallbackErr == nil {
-			DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | dns=system_fallback | resolver=system | result=%v | reason=nil-client", source, domain, ips)
 			return ips, nil
 		}
-		DWarnf("Mihomo DNS lookup failed | source=%s | domain=%q | err=nil-client | systemErr=%v", source, domain, fallbackErr)
 		return nil, fmt.Errorf("nil mihomo dns client")
 	}
 
@@ -530,7 +621,9 @@ func lookupDomainByMihomoClient(domain string, source string, client *MihomoDNSC
 
 	ips, resolverName, lookupErr := client.lookupIPsWithPreference(ctx, domain, preferProxy)
 	if lookupErr == nil {
-		DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | resolver=%s | dns=%s | result=%v", source, domain, resolverName, client.dnsTrace, ips)
+		if shouldLogMihomoDNSLookupSuccess(domain) {
+			DWarnf("Mihomo DNS lookup done | source=%s | domain=%q | resolver=%s | dns=%s | result=%v", source, domain, resolverName, client.dnsTrace, ips)
+		}
 		return ips, nil
 	}
 
@@ -550,10 +643,8 @@ func LookupByMihomoConfigFile(configPath string, domain string) ([]net.IP, error
 	if err != nil {
 		ips, fallbackErr := lookupBySystemResolver(domain)
 		if fallbackErr == nil {
-			DWarnf("Mihomo DNS lookup done | source=config_file | domain=%q | dns=system_fallback | result=%v | reason=%v", domain, ips, err)
 			return ips, nil
 		}
-		DWarnf("Mihomo DNS lookup failed | source=config_file | domain=%q | err=%v | systemErr=%v", domain, err, fallbackErr)
 		return nil, err
 	}
 	return lookupDomainByMihomoClient(domain, "config_file", client, true)
@@ -565,10 +656,8 @@ func LookupByMihomoConfigBytes(configContent []byte, domain string) ([]net.IP, e
 	if err != nil {
 		ips, fallbackErr := lookupBySystemResolver(domain)
 		if fallbackErr == nil {
-			DWarnf("Mihomo DNS lookup done | source=config_bytes | domain=%q | dns=system_fallback | result=%v | reason=%v", domain, ips, err)
 			return ips, nil
 		}
-		DWarnf("Mihomo DNS lookup failed | source=config_bytes | domain=%q | err=%v | systemErr=%v", domain, err, fallbackErr)
 		return nil, err
 	}
 	return lookupDomainByMihomoClient(domain, "config_bytes", client, true)
@@ -581,7 +670,6 @@ func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.I
 	if domain == "" {
 		return nil, false, fmt.Errorf("empty domain")
 	}
-	DLogf("Mihomo DNS lookup start | domain=%q | queryServers=%d", domain, len(queryServers))
 
 	var lastErr error
 	for idx, rawServer := range queryServers {
@@ -595,39 +683,31 @@ func LookupByMihomoDNSServers(domain string, queryServers []string) (ips []net.I
 		}
 
 		matched = true
-		DLogf("Mihomo DNS token matched | domain=%q | index=%d", domain, idx)
 		if parseErr != nil {
-			DLogf("Mihomo DNS token parse error | domain=%q | index=%d | err=%v", domain, idx, parseErr)
 			lastErr = parseErr
 			continue
 		}
 
 		client, clientErr := getCachedMihomoDNSClientFromConfigBytes(configContent)
 		if clientErr != nil {
-			DLogf("Mihomo DNS token client init failed | domain=%q | index=%d | err=%v", domain, idx, clientErr)
 			lastErr = clientErr
 			continue
 		}
 		ips, err = lookupDomainByMihomoClient(domain, fmt.Sprintf("token[%d]", idx), client, true)
 		if err != nil {
-			DLogf("Mihomo DNS token lookup failed | domain=%q | index=%d | err=%v", domain, idx, err)
 			lastErr = err
 			continue
 		}
 		if len(ips) > 0 {
-			DLogf("Mihomo DNS token lookup success | domain=%q | index=%d | ips=%v", domain, idx, ips)
 			return ips, true, nil
 		}
 	}
 
 	if !matched {
-		DLogf("Mihomo DNS lookup skip | domain=%q | reason=no mihomo token", domain)
 		return nil, false, nil
 	}
 	if lastErr != nil {
-		DLogf("Mihomo DNS lookup exhausted | domain=%q | err=%v", domain, lastErr)
 		return nil, true, lastErr
 	}
-	DLogf("Mihomo DNS lookup exhausted | domain=%q | err=no ip found", domain)
 	return nil, true, fmt.Errorf("mihomo dns has no ip for domain=%q", domain)
 }
