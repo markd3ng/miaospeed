@@ -57,7 +57,7 @@ func calcAvgPing(values []uint16) uint16 {
 	}
 
 	// 排序切片
-	sort.Slice(nonZeroLatencies, func(i, j int) bool { return totalMS[i] < totalMS[j] })
+	sort.Slice(nonZeroLatencies, func(i, j int) bool { return nonZeroLatencies[i] < nonZeroLatencies[j] })
 
 	// 移除最高和最低延迟
 	trimmedLatencies := nonZeroLatencies[1 : len(nonZeroLatencies)-1]
