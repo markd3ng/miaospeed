@@ -25,6 +25,31 @@ type timeoutReader struct {
 	timeout time.Time
 }
 
+func durationToMillisU16(d time.Duration) uint16 {
+	if d <= 0 {
+		return 0
+	}
+
+	ms := d.Milliseconds()
+	// Avoid reporting 0ms for successful sub-millisecond probes.
+	if ms == 0 {
+		ms = 1
+	}
+
+	const maxUint16Millis = int64(^uint16(0))
+	if ms > maxUint16Millis {
+		return ^uint16(0)
+	}
+	return uint16(ms)
+}
+
+func elapsedMillisU16(start, end time.Time) uint16 {
+	if start.IsZero() || end.IsZero() {
+		return 0
+	}
+	return durationToMillisU16(end.Sub(start))
+}
+
 func (tr *timeoutReader) Read(p []byte) (n int, err error) {
 	if time.Now().After(tr.timeout) {
 		return 0, errors.New("read timeout")
@@ -68,30 +93,36 @@ func pingViaTrace(ctx context.Context, p interfaces.Vendor, url string) (uint16,
 		return 0, 0, 0, err
 	}
 
-	var tlsStart, tlsEnd, writeStart, writeEnd int64
+	var tlsStart, tlsEnd, writeStart, writeEnd time.Time
 	trace := &httptrace.ClientTrace{
-		TLSHandshakeStart:    func() { tlsStart = time.Now().UnixMilli() },
-		TLSHandshakeDone:     func(_ tls.ConnectionState, err error) { tlsEnd = time.Now().UnixMilli() },
-		GotFirstResponseByte: func() { writeEnd = time.Now().UnixMilli() },
-		WroteHeaders:         func() { writeStart = time.Now().UnixMilli() },
+		TLSHandshakeStart:    func() { tlsStart = time.Now() },
+		TLSHandshakeDone:     func(_ tls.ConnectionState, err error) { tlsEnd = time.Now() },
+		GotFirstResponseByte: func() { writeEnd = time.Now() },
+		WroteHeaders:         func() { writeStart = time.Now() },
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
-	connStart := time.Now().UnixMilli()
+	connStart := time.Now()
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	defer resp.Body.Close()
 
-	connEnd := time.Now().UnixMilli()
-	utils.DBlackhole(!strings.HasPrefix(url, "https:"), connEnd-writeEnd, writeEnd-tlsEnd, tlsEnd-tlsStart, tlsStart-connStart)
+	connEnd := time.Now()
+	utils.DBlackhole(
+		!strings.HasPrefix(url, "https:"),
+		elapsedMillisU16(writeEnd, connEnd),
+		elapsedMillisU16(tlsEnd, writeEnd),
+		elapsedMillisU16(tlsStart, tlsEnd),
+		elapsedMillisU16(connStart, tlsStart),
+	)
 
 	if !strings.HasPrefix(url, "https:") {
-		return uint16(writeStart - connStart), uint16(writeEnd - connStart), resp.StatusCode, nil
+		return elapsedMillisU16(connStart, writeStart), elapsedMillisU16(connStart, writeEnd), resp.StatusCode, nil
 	}
 	if resp.TLS != nil && resp.TLS.HandshakeComplete {
-		return uint16(writeEnd - tlsEnd), uint16(writeEnd - connStart), resp.StatusCode, nil
+		return elapsedMillisU16(tlsEnd, writeEnd), elapsedMillisU16(connStart, writeEnd), resp.StatusCode, nil
 	}
 	return 0, 0, 0, fmt.Errorf("cannot extract payload from response")
 }
@@ -118,32 +149,37 @@ func pingViaNetCat(ctx context.Context, p interfaces.Vendor, url string) (uint16
 		return 0, 0, 0, fmt.Errorf("write failed 1: %w", err)
 	}
 
-	_, _ = reader.Peek(1) // Flush buffer
-	tcpRTT := time.Since(tcpStart).Milliseconds()
-	connRTT := time.Since(connStart).Milliseconds()
-	statusCode, err := saferParseHTTPStatus(reader)
+	if _, err := reader.Peek(1); err != nil {
+		return 0, 0, 0, fmt.Errorf("read failed 1: %w", err)
+	}
+	firstRTT := durationToMillisU16(time.Since(tcpStart))
+	connRTT := durationToMillisU16(time.Since(connStart))
+	firstStatusCode, err := saferParseHTTPStatus(reader)
+	if err != nil {
+		return firstRTT, connRTT, 0, nil
+	}
+
 	//_, _, _ = reader.ReadLine()
 	for reader.Buffered() > 0 {
 		_, _, _ = reader.ReadLine()
 	}
+
 	tcpStart = time.Now()
 	if _, err := conn.Write([]byte(payload)); err != nil {
-		return 0, 0, 0, fmt.Errorf("write failed 2: %w", err)
+		return firstRTT, connRTT, firstStatusCode, nil
 	}
 	if _, err := reader.Peek(1); err != nil {
-		if err == io.EOF {
-			return uint16(tcpRTT), uint16(connRTT), statusCode, nil
-		}
+		return firstRTT, connRTT, firstStatusCode, nil
+	}
 
-		return uint16(tcpRTT), uint16(connRTT), statusCode, fmt.Errorf("read failed 2: %w", err)
-	}
 	// resend the request to get the RTT of the second request
-	tcpRTT = time.Since(tcpStart).Milliseconds()
-	statusCode, err = saferParseHTTPStatus(reader)
+	secondRTT := durationToMillisU16(time.Since(tcpStart))
+	secondStatusCode, err := saferParseHTTPStatus(reader)
 	if err != nil {
-		return uint16(tcpRTT), 0, 0, nil
+		return firstRTT, connRTT, firstStatusCode, nil
 	}
-	return uint16(tcpRTT), uint16(connRTT), statusCode, nil
+
+	return secondRTT, connRTT, secondStatusCode, nil
 }
 
 func ping(obj *Ping, p interfaces.Vendor, url string, withAvg uint16, timeout uint) {

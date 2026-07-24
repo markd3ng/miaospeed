@@ -71,17 +71,14 @@ func RequestUnsafe(ctx context.Context, p interfaces.Vendor, reqOpt *interfaces.
 		TLSClientConfig:       &tlsConf,
 	}
 
-	if p != nil {
-		transport.Dial = func(string, string) (net.Conn, error) {
-			if reqOpt.SNI != "" {
-				return p.DialTCP(ctx, "https://"+reqOpt.SNI, reqOpt.Network)
-			}
-			return p.DialTCP(ctx, reqOpt.URL, reqOpt.Network)
+	transport.DialContext = func(reqCtx context.Context, _ string, addr string) (net.Conn, error) {
+		if reqCtx == nil {
+			reqCtx = ctx
 		}
-	} else {
-		transport.Dial = func(string, string) (net.Conn, error) {
-			return utils.Dial(reqOpt.Network.String(), reqOpt.URL)
+		if p != nil {
+			return p.DialTCP(reqCtx, formatDialAddressToURL(addr), reqOpt.Network)
 		}
+		return utils.DialContext(reqCtx, reqOpt.Network.String(), addr)
 	}
 
 	// make a list to record all redirects
@@ -107,6 +104,10 @@ func RequestUnsafe(ctx context.Context, p interfaces.Vendor, reqOpt *interfaces.
 	}
 
 	return resp, redirects, nil
+}
+
+func formatDialAddressToURL(addr string) string {
+	return "http://" + addr
 }
 
 func Request(ctx context.Context, p interfaces.Vendor, reqOpt *interfaces.RequestOptions) (duration uint16, bodyBytes []byte, resp *http.Response, redirects []string) {

@@ -1,6 +1,9 @@
 package clash
 
 import (
+	"net"
+	"strings"
+
 	"github.com/airportr/miaospeed/interfaces"
 	"github.com/airportr/miaospeed/utils"
 	"github.com/metacubex/mihomo/adapter"
@@ -18,9 +21,81 @@ func patch() {
 	logger := vendorlog.StandardLogger()
 	logger.ExitFunc = func(code int) {}
 }
-func parseProxy(proxyName, proxyPayload string) constant.Proxy {
+func pickResolvedProxyServerIP(ips []net.IP) (string, bool) {
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), true
+		}
+	}
+	for _, ip := range ips {
+		if ip.To16() != nil {
+			return ip.String(), true
+		}
+	}
+	return "", false
+}
+
+func setStringIfMissing(payload map[string]any, key string, val string) {
+	if payload == nil || strings.TrimSpace(val) == "" {
+		return
+	}
+	if existing, ok := payload[key]; ok {
+		if s, sok := existing.(string); sok && strings.TrimSpace(s) != "" {
+			return
+		}
+	}
+	payload[key] = val
+}
+
+func applyMihomoDNSForProxyServer(payload map[string]any, dnsServers []string) {
+	if len(dnsServers) == 0 || payload == nil {
+		return
+	}
+
+	rawServer, ok := payload["server"]
+	if !ok {
+		return
+	}
+	server, ok := rawServer.(string)
+	if !ok {
+		return
+	}
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return
+	}
+	if net.ParseIP(server) != nil {
+		return
+	}
+
+	ips, matched, err := utils.LookupByMihomoDNSServers(server, dnsServers)
+	if !matched {
+		return
+	}
+	if err != nil {
+		utils.DLogf("Mihomo DNS resolve proxy server failed | server=%q | err=%v", server, err)
+		return
+	}
+
+	resolvedIP, ok := pickResolvedProxyServerIP(ips)
+	if !ok {
+		utils.DLogf("Mihomo DNS resolved proxy server but no IP selected | server=%q", server)
+		return
+	}
+
+	payload["server"] = resolvedIP
+	// Preserve original domain for TLS/SNI-sensitive protocols.
+	setStringIfMissing(payload, "sni", server)
+	setStringIfMissing(payload, "servername", server)
+}
+
+func parseProxy(proxyName, proxyPayload string, dnsServers []string) constant.Proxy {
 	var payload map[string]any
-	yaml.Unmarshal([]byte(proxyPayload), &payload)
+	if err := yaml.Unmarshal([]byte(proxyPayload), &payload); err != nil {
+		utils.DLogf("Vendor Parser | Parse clash profile yaml error, error=%v", err.Error())
+		return nil
+	}
+	applyMihomoDNSForProxyServer(payload, dnsServers)
 	proxy, err := adapter.ParseProxy(payload)
 
 	if err != nil {
@@ -32,7 +107,11 @@ func parseProxy(proxyName, proxyPayload string) constant.Proxy {
 }
 
 func extractFirstProxy(proxyName, proxyPayload string) constant.Proxy {
-	proxy := parseProxy(proxyName, proxyPayload)
+	return extractFirstProxyWithDNS(proxyName, proxyPayload, nil)
+}
+
+func extractFirstProxyWithDNS(proxyName, proxyPayload string, dnsServers []string) constant.Proxy {
+	proxy := parseProxy(proxyName, proxyPayload, dnsServers)
 	if proxy == nil {
 		return nil
 	}

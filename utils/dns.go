@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/miekg/dns"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/miekg/dns"
 
 	"github.com/airportr/miaospeed/interfaces"
 	"github.com/airportr/miaospeed/utils/structs/memutils"
@@ -27,21 +28,39 @@ func DNSLookuper(addr string, queryServers []string) []net.IP {
 	}
 
 	ipSets := map[string]net.IP{}
-	for _, server := range queryServers {
+	for _, rawServer := range queryServers {
+		server := strings.TrimSpace(rawServer)
+		if server == "" {
+			continue
+		}
+		if configContent, matched, parseErr := parseMihomoDNSServerBase64(server); matched {
+			if parseErr != nil {
+				continue
+			}
+
+			ips, err := LookupByMihomoConfigBytes(configContent, addr)
+			if err != nil {
+				continue
+			}
+			for _, ip := range ips {
+				ipSets[ip.String()] = ip
+			}
+			continue
+		}
 		// DoH query for HTTPS server
-		if strings.HasPrefix(server, "https://") {
-			//parsedServer, err := urllib.Parse(server)
-			if parsedServer, err := urllib.Parse(server); err == nil {
-				baseURL := fmt.Sprintf("%s://%s", parsedServer.Scheme, parsedServer.Host)
-				if ips := DohLookup(addr, baseURL); ips != nil && len(ips) > 0 {
-					for _, ip := range ips {
-						ipSets[ip.String()] = ip
-					}
+		lowerServer := strings.ToLower(server)
+		if strings.HasPrefix(lowerServer, "https://") || strings.HasPrefix(lowerServer, "http://") {
+			if ips := DohLookup(addr, server); len(ips) > 0 {
+				for _, ip := range ips {
+					ipSets[ip.String()] = ip
 				}
 			}
 
 		} else {
 			// nomal DNS query
+			if _, _, err := net.SplitHostPort(server); err != nil {
+				server = net.JoinHostPort(server, "53")
+			}
 			r := &net.Resolver{
 				PreferGo: true,
 				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -68,24 +87,68 @@ func DNSLookuper(addr string, queryServers []string) []net.IP {
 	return ips
 }
 
+func normalizeDoHEndpoint(dohServer string) (*urllib.URL, error) {
+	dohServer = strings.TrimSpace(dohServer)
+	if dohServer == "" {
+		return nil, fmt.Errorf("empty DoH server")
+	}
+
+	endpoint, err := urllib.Parse(dohServer)
+	if err != nil {
+		return nil, err
+	}
+	scheme := strings.ToLower(endpoint.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return nil, fmt.Errorf("unsupported DoH scheme=%q", endpoint.Scheme)
+	}
+	if endpoint.Host == "" {
+		return nil, fmt.Errorf("invalid DoH host")
+	}
+
+	endpoint.Scheme = scheme
+	if endpoint.Path == "" || endpoint.Path == "/" {
+		endpoint.Path = "/dns-query"
+	}
+	if endpoint.Path != "/" {
+		endpoint.Path = strings.TrimSuffix(endpoint.Path, "/")
+	}
+	endpoint.Fragment = ""
+	return endpoint, nil
+}
+
 // DohLookup Use DNS over HTTPS to query A and AAAA records
 func DohLookup(domain, dohBaseURL string) []net.IP {
+	endpoint, err := normalizeDoHEndpoint(dohBaseURL)
+	if err != nil {
+		DLogf("Invalid DoH endpoint | server=%q | err=%v\n", dohBaseURL, err)
+		return nil
+	}
+
 	var wg sync.WaitGroup
 	var ips []net.IP
 	var mu sync.Mutex
+	client := &http.Client{
+		Timeout: time.Second * 5,
+	}
 
 	queryDNS := func(qtype uint16) {
 		defer wg.Done()
 
 		query := dns.Msg{}
 		query.SetQuestion(dns.Fqdn(domain), qtype)
-		msg, _ := query.Pack()
-		b64 := base64.RawURLEncoding.EncodeToString(msg)
-		dohURL := dohBaseURL + "/dns-query?dns=" + b64
-		client := &http.Client{
-			Timeout: time.Second * 5,
+		msg, err := query.Pack()
+		if err != nil {
+			DLogf("DNS over HTTPS request pack error | type=%d | err=%v\n", qtype, err)
+			return
 		}
-		req, err := http.NewRequest("GET", dohURL, nil)
+
+		b64 := base64.RawURLEncoding.EncodeToString(msg)
+		dohURL := *endpoint
+		queryValues := dohURL.Query()
+		queryValues.Set("dns", b64)
+		dohURL.RawQuery = queryValues.Encode()
+
+		req, err := http.NewRequest(http.MethodGet, dohURL.String(), nil)
 		if err != nil {
 			DLogf("Create request error | type=%d | err=%v\n", qtype, err)
 			return
@@ -94,8 +157,14 @@ func DohLookup(domain, dohBaseURL string) []net.IP {
 		resp, err := client.Do(req)
 		if err != nil {
 			DLogf("DNS over HTTPS query error | type=%d | err=%v\n", qtype, err)
+			return
 		}
 		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+			DLogf("DNS over HTTPS bad status | type=%d | status=%d | body=%q\n", qtype, resp.StatusCode, strings.TrimSpace(string(bodyPreview)))
+			return
+		}
 
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
